@@ -95,3 +95,158 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+import os
+import gzip
+import json
+import pickle
+from pathlib import Path
+from glob import glob
+import zipfile
+
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import (
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+
+def process_and_train_model():
+    # Load the ZIP files and convert them into DataFrames
+    data_frames = []
+    for zip_file in sorted(glob(os.path.join("files/input", "*.zip"))):  # Filter zip files
+        print(f"Processing ZIP file: {zip_file}")
+        with zipfile.ZipFile(zip_file, "r") as zip_ref:
+            for file_name in zip_ref.namelist():
+                with zip_ref.open(file_name) as file_handle:
+                    df = pd.read_csv(file_handle, sep=",", index_col=0)
+                    data_frames.append(df)
+    
+    print(f"Read {len(data_frames)} DataFrames from ZIP files.")
+    training_data, testing_data = data_frames  # Assuming there are two input files
+
+    # Data cleaning
+    print(f"Renaming columns and cleaning the DataFrame.")
+    training_data.rename(columns={"default payment next month": "default"}, inplace=True)
+    testing_data.rename(columns={"default payment next month": "default"}, inplace=True)
+    
+    # Check if the "ID" column exists before removing it
+    if "ID" in training_data.columns:
+        training_data.drop(columns=["ID"], inplace=True)
+        testing_data.drop(columns=["ID"], inplace=True)
+    
+    # Drop rows with missing values
+    training_data.dropna(inplace=True)
+    testing_data.dropna(inplace=True)
+
+    # Group values greater than 4 in the EDUCATION column
+    training_data['EDUCATION'] = training_data['EDUCATION'].apply(lambda x: 'others' if x > 4 else x)
+    testing_data['EDUCATION'] = testing_data['EDUCATION'].apply(lambda x: 'others' if x > 4 else x)
+    
+    # Convert categorical columns to string type to avoid errors with OneHotEncoder
+    categorical_columns = ["SEX", "EDUCATION", "MARRIAGE"]
+    training_data[categorical_columns] = training_data[categorical_columns].astype(str)
+    testing_data[categorical_columns] = testing_data[categorical_columns].astype(str)
+
+    # Split into features (X) and target variable (y)
+    X_train = training_data.drop(columns=["default"])
+    y_train = training_data["default"]
+    X_test = testing_data.drop(columns=["default"])
+    y_test = testing_data["default"]
+    
+    # Create the pipeline with OneHotEncoder and RandomForestClassifier
+    categorical_features = X_train.select_dtypes(include=["object"]).columns
+    categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))])
+    preprocessor = ColumnTransformer(transformers=[('cat', categorical_transformer, categorical_features)], remainder="passthrough")
+    
+    model = Pipeline(steps=[('prep', preprocessor), ('rf', RandomForestClassifier(random_state=42))])
+
+    # Hyperparameter optimization using GridSearchCV
+    parameter_grid = {
+        'rf__n_estimators': [100, 200, 500],
+        'rf__max_depth': [None, 5, 10],
+        'rf__min_samples_split': [2, 5],
+        'rf__min_samples_leaf': [1, 2]
+    }
+    grid_search = GridSearchCV(model, param_grid=parameter_grid, cv=10, scoring='balanced_accuracy', n_jobs=-1, refit=True, verbose=2)
+    grid_search.fit(X_train, y_train)
+
+    # Save the trained model in compressed format
+    model_save_path = 'files/models/model.pkl.gz'
+    os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+    with gzip.open(model_save_path, 'wb') as f:
+        pickle.dump(grid_search.best_estimator_, f)
+
+    # Predictions and metrics
+    y_train_pred = grid_search.predict(X_train)
+    y_test_pred = grid_search.predict(X_test)
+
+    # Calculate metrics
+    training_metrics = {
+        "type": "metrics",
+        "dataset": "train",
+        "precision": precision_score(y_train, y_train_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_train, y_train_pred),
+        "recall": recall_score(y_train, y_train_pred, zero_division=0),
+        "f1_score": f1_score(y_train, y_train_pred, zero_division=0),
+    }
+
+    testing_metrics = {
+        "type": "metrics",
+        "dataset": "test",
+        "precision": precision_score(y_test, y_test_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_test, y_test_pred),
+        "recall": recall_score(y_test, y_test_pred, zero_division=0),
+        "f1_score": f1_score(y_test, y_test_pred, zero_division=0),
+    }
+
+    # Confusion matrices
+    cm_train = confusion_matrix(y_train, y_train_pred)
+    cm_test = confusion_matrix(y_test, y_test_pred)
+
+    cm_train_dict = {
+        "type": "cm_matrix",
+        "dataset": "train",
+        "true_0": {
+            "predicted_0": int(cm_train[0, 0]),
+            "predicted_1": int(cm_train[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_train[1, 0]),
+            "predicted_1": int(cm_train[1, 1]),
+        },
+    }
+
+    cm_test_dict = {
+        "type": "cm_matrix",
+        "dataset": "test",
+        "true_0": {
+            "predicted_0": int(cm_test[0, 0]),
+            "predicted_1": int(cm_test[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm_test[1, 0]),
+            "predicted_1": int(cm_test[1, 1]),
+        },
+    }
+
+    # Save metrics and confusion matrices in JSON files
+    output_dir = 'files/output'
+    os.makedirs(output_dir, exist_ok=True)
+    
+    with open(os.path.join(output_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
+        json.dump([training_metrics, testing_metrics, cm_train_dict, cm_test_dict], f)
+
+    print("Process completed and files saved.")
+
+
+# Run the function
+if __name__ == "__main__":
+    process_and_train_model()
